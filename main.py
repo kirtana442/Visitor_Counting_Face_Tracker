@@ -1,36 +1,107 @@
 import cv2
+import numpy as np
 import os
 import json
 import time
+import sqlite3
 from datetime import datetime
-import math
+from ultralytics import YOLO
+from insightface.app import FaceAnalysis
 
-# Load config
 with open("config.json") as f:
     config = json.load(f)
 
 FRAME_SKIP = config["frame_skip"]
-DIST_THRESHOLD = config["distance_threshold"]
+SIM_THRESHOLD = config["similarity_threshold"]
+EXIT_TIME = config["exit_time_seconds"]
 
-# Setup
-cap = cv2.VideoCapture("video_sample1.mp4")  
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+cap = cv2.VideoCapture("video_sample1.mp4")
+
+model = YOLO("yolov8n.pt")
+
+app = FaceAnalysis(name="buffalo_l")
+app.prepare(ctx_id=-1)
+
+conn = sqlite3.connect("faces.db")
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS faces (
+    id INTEGER PRIMARY KEY,
+    embedding BLOB
 )
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    face_id INTEGER,
+    event TEXT,
+    timestamp TEXT,
+    image_path TEXT
+)
+""")
+
 os.makedirs("logs/entries", exist_ok=True)
 os.makedirs("logs/exits", exist_ok=True)
 
 log_file = open("events.log", "a")
 
-# Tracking
+known_faces = {}
+active_faces = {}
+last_exit_time = {}
 face_id_counter = 0
-active_faces = {}  # id -> (x, y, last_seen)
+COOLDOWN = 5
 
-def get_center(x, y, w, h):
-    return (x + w//2, y + h//2)
+def cosine_similarity(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def distance(p1, p2):
-    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+def update_embedding(old_emb, new_emb):
+    return (old_emb + new_emb) / 2
+
+def get_face_id(embedding):
+    global face_id_counter
+    best_match = None
+    best_score = -1
+
+    for fid, emb in known_faces.items():
+        score = cosine_similarity(embedding, emb)
+        if score > best_score:
+            best_score = score
+            best_match = fid
+
+    if best_score > SIM_THRESHOLD:
+        known_faces[best_match] = update_embedding(known_faces[best_match], embedding)
+        return best_match
+
+    face_id_counter += 1
+    fid = face_id_counter
+    known_faces[fid] = embedding
+
+    cursor.execute(
+        "INSERT INTO faces (id, embedding) VALUES (?, ?)",
+        (fid, embedding.tobytes())
+    )
+    conn.commit()
+
+    return fid
+
+def log_event(fid, event_type, face_img=None):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = None
+
+    if face_img is not None:
+        folder = "entries" if event_type == "ENTRY" else "exits"
+        path = f"logs/{folder}/face_{fid}_{timestamp}.jpg"
+        cv2.imwrite(path, face_img)
+
+    log_file.write(f"[{timestamp}] {event_type} FaceID={fid} {path}\n")
+
+    cursor.execute(
+        "INSERT INTO events (face_id, event, timestamp, image_path) VALUES (?, ?, ?, ?)",
+        (fid, event_type, timestamp, path)
+    )
+    conn.commit()
 
 frame_count = 0
 
@@ -40,66 +111,55 @@ while True:
         break
 
     frame_count += 1
-
     if frame_count % FRAME_SKIP != 0:
         continue
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+    results = model(frame)[0]
 
-    current_centers = []
+    if len(results.boxes) == 0:
+        continue
 
-    for (x, y, w, h) in faces:
-        center = get_center(x, y, w, h)
-        current_centers.append((center, (x, y, w, h)))
+    box = results.boxes[0]
+    x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-    matched_ids = set()
+    face_crop = frame[y1:y2, x1:x2]
+    if face_crop.size == 0:
+        continue
 
-    for center, box in current_centers:
-        matched = False
+    faces = app.get(face_crop)
+    if len(faces) == 0:
+        continue
 
-        for fid in list(active_faces.keys()):
-            prev_center = active_faces[fid][0]
+    embedding = faces[0].embedding
+    fid = get_face_id(embedding)
 
-            if distance(center, prev_center) < DIST_THRESHOLD:
-                active_faces[fid] = (center, time.time())
-                matched_ids.add(fid)
-                matched = True
-                break
+    if fid not in active_faces:
+        if fid in last_exit_time and (time.time() - last_exit_time[fid] < COOLDOWN):
+            continue
+        log_event(fid, "ENTRY", face_crop)
 
-        if not matched:
-            # NEW FACE → ENTRY
-            face_id_counter += 1
-            fid = face_id_counter
-            active_faces[fid] = (center, time.time())
+    active_faces[fid] = time.time()
 
-            x, y, w, h = box
-            face_img = frame[y:y+h, x:x+w]
-
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = f"logs/entries/face_{fid}_{timestamp}.jpg"
-            cv2.imwrite(path, face_img)
-
-            log_file.write(f"[{timestamp}] ENTRY FaceID={fid} {path}\n")
-            print(f"ENTRY FaceID={fid}")
-
-    # Detect exits
-    current_time = time.time()
+    now = time.time()
     to_remove = []
 
-    for fid in active_faces:
-        last_seen = active_faces[fid][1]
+    for fid_check, last_seen in active_faces.items():
+        if now - last_seen > EXIT_TIME:
+            log_event(fid_check, "EXIT")
+            last_exit_time[fid_check] = time.time()
+            to_remove.append(fid_check)
 
-        if current_time - last_seen > 2:  # disappeared
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for fid_check in to_remove:
+        del active_faces[fid_check]
 
-            log_file.write(f"[{timestamp}] EXIT FaceID={fid}\n")
-            print(f"EXIT FaceID={fid}")
+now = time.time()
 
-            to_remove.append(fid)
+for fid in list(active_faces.keys()):
+    log_event(fid, "EXIT")
+    last_exit_time[fid] = now
 
-    for fid in to_remove:
-        del active_faces[fid]
+active_faces.clear()
 
 cap.release()
 log_file.close()
+conn.close()
