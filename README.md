@@ -7,6 +7,10 @@ This project implements an AI-driven face tracking and visitor counting system. 
 The implementation is designed to be modular and extensible, allowing integration with production-grade tracking systems and real-time camera streams.
 
 ---
+### Project Explanation Video
+
+[Watch the demo video](https://drive.google.com/file/d/11bKmJCFeGQ7BamsNUB5bl0JOjOEh759p/view?usp=sharing)
+---
 
 ## Features
 
